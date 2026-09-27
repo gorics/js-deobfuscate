@@ -47,6 +47,7 @@ jobs:
 
       - name: Run full v783 upstream network
         run: |
+          mkdir -p flybrain-result
           cat > run_upstream.py <<'PY'
           import json
           import sys
