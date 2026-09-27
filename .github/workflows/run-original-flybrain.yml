@@ -1,0 +1,176 @@
+name: Run Original FlyWire v783 Brain
+
+on:
+  push:
+    branches:
+      - flybrain-original-run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-original-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout runner repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Show runner resources
+        run: |
+          uname -a
+          free -h
+          df -h
+
+      - name: Install original-compatible dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'numpy==1.24.4' \
+            'pandas==2.0.3' \
+            'pyarrow==12.0.1' \
+            'joblib==1.3.2' \
+            'brian2==2.5.1'
+
+      - name: Clone upstream original model
+        run: |
+          git clone --depth 1 https://github.com/philshiu/Drosophila_brain_model.git upstream
+          ls -lh upstream/model.py upstream/Completeness_783.csv upstream/Connectivity_783.parquet
+          sha256sum upstream/model.py upstream/Completeness_783.csv upstream/Connectivity_783.parquet | tee upstream-sha256.txt
+
+      - name: Run full v783 upstream network
+        run: |
+          cat > run_upstream.py <<'PY'
+          import json
+          import sys
+          import time
+          import traceback
+          from pathlib import Path
+
+          import pandas as pd
+          from brian2 import ms, prefs, defaultclock
+
+          ROOT = Path('upstream').resolve()
+          OUT = Path('flybrain-result').resolve()
+          OUT.mkdir(exist_ok=True)
+          sys.path.insert(0, str(ROOT))
+
+          prefs.codegen.target = 'numpy'
+          defaultclock.dt = 0.1 * ms
+
+          import model
+
+          comp = ROOT / 'Completeness_783.csv'
+          con = ROOT / 'Connectivity_783.parquet'
+          df_comp = pd.read_csv(comp, index_col=0)
+          df_con = pd.read_parquet(con, columns=['Presynaptic_Index', 'Postsynaptic_Index', 'Excitatory x Connectivity'])
+          target = int(df_comp.index[0])
+
+          base = model.default_params.copy()
+          base['t_run'] = 20 * ms
+          base['n_run'] = 1
+
+          common = {
+              'upstream_repo': 'philshiu/Drosophila_brain_model',
+              'connectome': 'FlyWire v783',
+              'neurons': int(len(df_comp)),
+              'connectivity_rows': int(len(df_con)),
+              'stimulated_flywire_id': target,
+              'duration_ms': 20,
+              'trials': 1,
+              'python': sys.version,
+          }
+          print('ORIGINAL_START ' + json.dumps(common), flush=True)
+
+          def summarize(path, elapsed, mode, exact_error=None):
+              spikes = pd.read_parquet(path)
+              result = dict(common)
+              result.update({
+                  'status': 'success',
+                  'mode': mode,
+                  'elapsed_seconds': round(elapsed, 3),
+                  'spike_events': int(len(spikes)),
+                  'active_neurons': int(spikes['flywire_id'].nunique()) if len(spikes) else 0,
+                  'first_spikes': spikes.head(25).to_dict(orient='records'),
+              })
+              if exact_error is not None:
+                  result['exact_original_error'] = exact_error
+              return result
+
+          try:
+              t0 = time.time()
+              model.run_exp(
+                  exp_name='exact_v783_20ms',
+                  neu_exc=[target],
+                  path_res=OUT,
+                  path_comp=comp,
+                  path_con=con,
+                  params=base,
+                  n_proc=1,
+                  force_overwrite=True,
+              )
+              result = summarize(OUT/'exact_v783_20ms.parquet', time.time()-t0, 'exact_original_model_py')
+          except Exception as e:
+              exact_error = repr(e)
+              print('EXACT_ORIGINAL_FAILED ' + exact_error, flush=True)
+              try:
+                  compat = base.copy()
+                  compat['eq_rst'] = 'v = v_rst; g = 0 * mV'
+                  t0 = time.time()
+                  model.run_exp(
+                      exp_name='exact_v783_20ms_compat',
+                      neu_exc=[target],
+                      path_res=OUT,
+                      path_comp=comp,
+                      path_con=con,
+                      params=compat,
+                      n_proc=1,
+                      force_overwrite=True,
+                  )
+                  result = summarize(
+                      OUT/'exact_v783_20ms_compat.parquet',
+                      time.time()-t0,
+                      'original_model_py_with_reset_compatibility_patch',
+                      exact_error=exact_error,
+                  )
+              except Exception as e2:
+                  result = dict(common)
+                  result.update({
+                      'status': 'error',
+                      'exact_original_error': exact_error,
+                      'compat_error': repr(e2),
+                      'traceback': traceback.format_exc(),
+                  })
+
+          (OUT/'result.json').write_text(json.dumps(result, indent=2, default=str), encoding='utf-8')
+          print('ORIGINAL_RESULT ' + json.dumps(result, default=str), flush=True)
+          if result['status'] != 'success':
+              raise SystemExit(2)
+          PY
+          /usr/bin/time -v python run_upstream.py 2>&1 | tee flybrain-result/run.log
+
+      - name: Show final result
+        if: always()
+        run: |
+          cat flybrain-result/result.json || true
+          free -h
+
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-flywire-v783-run
+          path: |
+            flybrain-result/result.json
+            flybrain-result/run.log
+            flybrain-result/*.parquet
+            upstream-sha256.txt
+          if-no-files-found: warn
+          retention-days: 3
